@@ -213,7 +213,6 @@ def main():
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
         close_loop=False,
-        pool_timeout=60,
         read_timeout=60,
         write_timeout=60,
         connect_timeout=60
