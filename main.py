@@ -67,62 +67,79 @@ bot = Bot(token=CONFIG["TELEGRAM_TOKEN"])
 
 def generate_stability_image(prompt: str) -> BytesIO | None:
     """Генерация через Stability AI."""
-    try:
-        logger.info(f"Отправка запроса в Stability AI с промптом: {prompt}")
-        
-        # Проверяем версию API
-        api_host = os.getenv('STABILITY_HOST', 'https://api.stability.ai')
-        
-        # Используем более старую версию API, которая лучше поддерживается
-        response = requests.post(
-            f"{api_host}/v1/generation/stable-diffusion-v1-5/text-to-image",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Authorization": f"Bearer {CONFIG['STABILITY_API_KEY']}"
-            },
-            json={
-                "text_prompts": [
-                    {
-                        "text": prompt,
-                        "weight": 1.0
-                    }
-                ],
-                "cfg_scale": 7.0,
-                "height": 512,
-                "width": 512,
-                "samples": 1,
-                "steps": 30
-            },
-            timeout=40
-        )
-        
-        logger.info(f"Получен ответ от Stability AI. Статус: {response.status_code}")
-        
-        if not response.ok:
-            logger.error(f"Ошибка Stability API: {response.status_code} - {response.text}")
-            return None
-            
-        # Проверяем содержимое ответа
+    # Список доступных движков в порядке предпочтения
+    engines = [
+        "stable-diffusion-xl-1024-v1-0", 
+        "stable-diffusion-v1-6", 
+        "stable-diffusion-512-v2-1"
+    ]
+    
+    # Пробуем каждый движок по очереди
+    for engine in engines:
         try:
-            json_response = response.json()
-            logger.info(f"Получен JSON ответ от Stability API: {json_response.keys()}")
+            logger.info(f"Отправка запроса в Stability AI с промптом: {prompt}, движок: {engine}")
             
-            if "artifacts" in json_response and json_response["artifacts"]:
-                logger.info("Найдены артефакты в ответе, декодируем изображение")
-                image_data = base64.b64decode(json_response["artifacts"][0]["base64"])
-                return BytesIO(image_data)
-            else:
-                logger.error(f"Отсутствуют артефакты в ответе: {json_response}")
-                return None
+            # Проверяем версию API
+            api_host = os.getenv('STABILITY_HOST', 'https://api.stability.ai')
+            
+            # Настраиваем размеры в зависимости от движка
+            height = 1024 if "1024" in engine else 512
+            width = 1024 if "1024" in engine else 512
+            
+            # Отправляем запрос
+            response = requests.post(
+                f"{api_host}/v1/generation/{engine}/text-to-image",
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {CONFIG['STABILITY_API_KEY']}"
+                },
+                json={
+                    "text_prompts": [
+                        {
+                            "text": prompt,
+                            "weight": 1.0
+                        }
+                    ],
+                    "cfg_scale": 7.0,
+                    "height": height,
+                    "width": width,
+                    "samples": 1,
+                    "steps": 30
+                },
+                timeout=40
+            )
+            
+            logger.info(f"Получен ответ от Stability AI. Статус: {response.status_code}")
+            
+            if not response.ok:
+                logger.error(f"Ошибка Stability API для движка {engine}: {response.status_code} - {response.text}")
+                continue  # Пробуем следующий движок
+                
+            # Проверяем содержимое ответа
+            try:
+                json_response = response.json()
+                logger.info(f"Получен JSON ответ от Stability API: {json_response.keys()}")
+                
+                if "artifacts" in json_response and json_response["artifacts"]:
+                    logger.info(f"Найдены артефакты в ответе для движка {engine}, декодируем изображение")
+                    image_data = base64.b64decode(json_response["artifacts"][0]["base64"])
+                    return BytesIO(image_data)
+                else:
+                    logger.error(f"Отсутствуют артефакты в ответе для движка {engine}: {json_response}")
+                    continue  # Пробуем следующий движок
+            except Exception as e:
+                logger.error(f"Ошибка при обработке JSON ответа для движка {engine}: {e}", exc_info=True)
+                logger.error(f"Содержимое ответа: {response.text[:200]}")
+                continue  # Пробуем следующий движок
+                
         except Exception as e:
-            logger.error(f"Ошибка при обработке JSON ответа: {e}", exc_info=True)
-            logger.error(f"Содержимое ответа: {response.text[:200]}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Stability AI error: {e}", exc_info=True)
-        return None
+            logger.error(f"Stability AI error для движка {engine}: {e}", exc_info=True)
+            continue  # Пробуем следующий движок
+    
+    # Если все движки не сработали
+    logger.error("Все движки Stability AI не смогли сгенерировать изображение")
+    return None
 
 def generate_hf_image(prompt: str) -> BytesIO | None:
     """Генерация через Hugging Face."""
