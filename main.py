@@ -6,6 +6,8 @@ import os
 from dotenv import load_dotenv
 import asyncio
 import telegram
+import sys
+from logging.handlers import RotatingFileHandler
 
 from deep_translator import GoogleTranslator
 from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
@@ -21,15 +23,43 @@ from telegram.ext import (
 # Загружаем переменные окружения
 load_dotenv()
 
+# Настраиваем логирование
 logger = logging.getLogger("ImageGenBot")
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.DEBUG)
+
+# Форматирование логов
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Вывод в консоль
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# Вывод в файл с ротацией (максимум 5 файлов по 2 МБ)
+try:
+    file_handler = RotatingFileHandler('bot.log', maxBytes=2*1024*1024, backupCount=5)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.info("Логирование в файл настроено")
+except Exception as e:
+    logger.warning(f"Не удалось настроить логирование в файл: {e}")
 
 CONFIG = {
     "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
     "STABILITY_API_KEY": os.getenv("STABILITY_API_KEY"),
     "HF_TOKEN": os.getenv("HF_TOKEN")
 }
+
+# Проверяем наличие всех необходимых токенов
+if not CONFIG["TELEGRAM_TOKEN"]:
+    logger.critical("Отсутствует токен Telegram в переменных окружения")
+    sys.exit(1)
+if not CONFIG["STABILITY_API_KEY"]:
+    logger.warning("Отсутствует ключ Stability API в переменных окружения")
+if not CONFIG["HF_TOKEN"]:
+    logger.warning("Отсутствует токен Hugging Face в переменных окружения")
 
 MODEL_CHOICE, PROMPT_INPUT = range(2)
 
@@ -38,28 +68,67 @@ bot = Bot(token=CONFIG["TELEGRAM_TOKEN"])
 def generate_stability_image(prompt: str) -> BytesIO | None:
     """Генерация через Stability AI."""
     try:
+        logger.info(f"Отправка запроса в Stability AI с промптом: {prompt}")
+        
+        # Проверяем версию API
+        api_host = os.getenv('STABILITY_HOST', 'https://api.stability.ai')
+        
+        # Используем более старую версию API, которая лучше поддерживается
         response = requests.post(
-            "https://api.stability.ai/v2beta/stable-image/generate/sd3",
-            headers={"Authorization": f"Bearer {CONFIG['STABILITY_API_KEY']}"},
-            files={"none": ''},
-            data={
-                "prompt": prompt,
-                "output_format": "jpeg",
-                "width": 1024,
-                "height": 1024,
-                "seed": 0,
-                "cfg_scale": 7
+            f"{api_host}/v1/generation/stable-diffusion-v1-5/text-to-image",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {CONFIG['STABILITY_API_KEY']}"
+            },
+            json={
+                "text_prompts": [
+                    {
+                        "text": prompt,
+                        "weight": 1.0
+                    }
+                ],
+                "cfg_scale": 7.0,
+                "height": 512,
+                "width": 512,
+                "samples": 1,
+                "steps": 30
             },
             timeout=40
         )
-        return BytesIO(response.content) if response.ok else None
+        
+        logger.info(f"Получен ответ от Stability AI. Статус: {response.status_code}")
+        
+        if not response.ok:
+            logger.error(f"Ошибка Stability API: {response.status_code} - {response.text}")
+            return None
+            
+        # Проверяем содержимое ответа
+        try:
+            json_response = response.json()
+            logger.info(f"Получен JSON ответ от Stability API: {json_response.keys()}")
+            
+            if "artifacts" in json_response and json_response["artifacts"]:
+                logger.info("Найдены артефакты в ответе, декодируем изображение")
+                image_data = base64.b64decode(json_response["artifacts"][0]["base64"])
+                return BytesIO(image_data)
+            else:
+                logger.error(f"Отсутствуют артефакты в ответе: {json_response}")
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка при обработке JSON ответа: {e}", exc_info=True)
+            logger.error(f"Содержимое ответа: {response.text[:200]}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Stability AI error: {e}")
+        logger.error(f"Stability AI error: {e}", exc_info=True)
         return None
 
 def generate_hf_image(prompt: str) -> BytesIO | None:
     """Генерация через Hugging Face."""
     try:
+        logger.info(f"Отправка запроса в Hugging Face с промптом: {prompt}")
+        
         response = requests.post(
             "https://router.huggingface.co/nebius/v1/images/generations",
             headers={"Authorization": f"Bearer {CONFIG['HF_TOKEN']}"},
@@ -72,12 +141,35 @@ def generate_hf_image(prompt: str) -> BytesIO | None:
             },
             timeout=40
         )
+        
+        logger.info(f"Получен ответ от Hugging Face. Статус: {response.status_code}")
+        
         if not response.ok:
+            logger.error(f"Ошибка Hugging Face API: {response.status_code} - {response.text}")
             return None
-        img_data = response.json()["data"][0]["b64_json"]
-        return BytesIO(base64.b64decode(img_data))
+            
+        try:
+            json_data = response.json()
+            logger.info("Успешно получен JSON ответ от Hugging Face")
+            
+            if "data" not in json_data or not json_data["data"]:
+                logger.error(f"Отсутствует поле 'data' в ответе: {json_data}")
+                return None
+                
+            if "b64_json" not in json_data["data"][0]:
+                logger.error(f"Отсутствует поле 'b64_json' в ответе: {json_data['data'][0]}")
+                return None
+                
+            img_data = json_data["data"][0]["b64_json"]
+            logger.info("Успешно извлечены данные изображения, декодируем base64")
+            return BytesIO(base64.b64decode(img_data))
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке JSON ответа: {e}", exc_info=True)
+            return None
+            
     except Exception as e:
-        logger.error(f"Hugging Face error: {e}")
+        logger.error(f"Hugging Face error: {e}", exc_info=True)
         return None
 
 def translate_prompt(text: str) -> str:
@@ -117,9 +209,14 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return PROMPT_INPUT
 
     model = context.user_data.get("model", "stability")
+    logger.info(f"Выбрана модель: {model}")
+    
     translated_prompt = translate_prompt(prompt)
+    logger.info(f"Исходный промпт: '{prompt}', переведенный: '{translated_prompt}'")
+    
     status_msg = await update.message.reply_text("Генерация...")
 
+    logger.info(f"Начинаем генерацию изображения с моделью {model}")
     image = (
         generate_stability_image(translated_prompt)
         if model == "stability"
@@ -127,9 +224,11 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     if not image:
-        await update.message.reply_text("Ошибка генерации. Попробуй другой запрос.")
+        logger.error(f"Генерация изображения не удалась для промпта: '{prompt}'")
+        await update.message.reply_text("Ошибка генерации. Попробуйте другой запрос.")
         return MODEL_CHOICE
 
+    logger.info("Изображение успешно сгенерировано, отправляем пользователю")
     await bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg.message_id)
     
     # Добавляем повторные попытки отправки фото
@@ -170,8 +269,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     """Запуск бота."""
+    logger.info("Инициализация бота...")
+    
     # Создаем приложение с увеличенным таймаутом
     app = Application.builder().token(CONFIG["TELEGRAM_TOKEN"]).connect_timeout(60).read_timeout(60).write_timeout(60).build()
+    logger.info("Приложение создано с увеличенными таймаутами")
     
     # Добавляем обработчик ошибок
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,6 +281,7 @@ def main():
         logger.error("Exception while handling an update:", exc_info=context.error)
         
         if isinstance(context.error, telegram.error.TimedOut):
+            logger.warning("Обнаружена ошибка таймаута Telegram API")
             if update and update.effective_message:
                 await update.effective_message.reply_text(
                     "Произошла ошибка при отправке сообщения. Пожалуйста, попробуйте еще раз."
@@ -190,6 +293,7 @@ def main():
             # Очищаем очередь обновлений
             await context.bot.get_updates(offset=-1)
         else:
+            logger.error(f"Неизвестная ошибка: {type(context.error).__name__}: {context.error}")
             if update and update.effective_message:
                 await update.effective_message.reply_text(
                     "Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже."
@@ -197,7 +301,10 @@ def main():
     
     # Регистрируем обработчик ошибок
     app.add_error_handler(error_handler)
+    logger.info("Обработчик ошибок зарегистрирован")
     
+    # Добавляем обработчики команд
+    logger.info("Регистрация обработчиков команд...")
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -206,7 +313,9 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
-    logger.info("Бот запущен!")
+    logger.info("Обработчики команд зарегистрированы")
+    
+    logger.info("Бот запущен! Ожидание сообщений...")
     
     # Запускаем бота с параметрами
     app.run_polling(
