@@ -46,9 +46,12 @@ try:
 except Exception as e:
     logger.warning(f"Не удалось настроить логирование в файл: {e}")
 
+# Получаем API ключи из переменных окружения или используем значения по умолчанию
+stability_api_key = os.getenv("STABILITY_API_KEY", "sk-6gniSvAdfLZRmhpfC3Pjzzl7KkXkvBSOyATCfb5RwCcxnsov")
+
 CONFIG = {
     "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
-    "STABILITY_API_KEY": os.getenv("STABILITY_API_KEY"),
+    "STABILITY_API_KEY": stability_api_key,
     "HF_TOKEN": os.getenv("HF_TOKEN")
 }
 
@@ -61,6 +64,8 @@ if not CONFIG["STABILITY_API_KEY"]:
 if not CONFIG["HF_TOKEN"]:
     logger.warning("Отсутствует токен Hugging Face в переменных окружения")
 
+logger.info("Конфигурация загружена успешно")
+
 MODEL_CHOICE, PROMPT_INPUT = range(2)
 
 bot = Bot(token=CONFIG["TELEGRAM_TOKEN"])
@@ -69,11 +74,15 @@ def generate_stability_image(prompt: str) -> BytesIO | None:
     """Генерация через Stability AI."""
     # Список доступных движков в порядке предпочтения
     engines = [
-        "stable-diffusion-xl-1024-v1-0", 
-        "stable-diffusion-v1-6", 
-        "stable-diffusion-512-v2-1"
+        "stable-diffusion-xl-1024-v1-0",  # Первая доступная модель
+        "stable-diffusion-v1-6"           # Вторая доступная модель
     ]
     
+    # Проверяем API ключ
+    if not CONFIG["STABILITY_API_KEY"]:
+        logger.error("Отсутствует ключ Stability API")
+        return None
+        
     # Пробуем каждый движок по очереди
     for engine in engines:
         try:
@@ -83,8 +92,8 @@ def generate_stability_image(prompt: str) -> BytesIO | None:
             api_host = os.getenv('STABILITY_HOST', 'https://api.stability.ai')
             
             # Настраиваем размеры в зависимости от движка
-            height = 1024 if "1024" in engine else 512
-            width = 1024 if "1024" in engine else 512
+            height = 1024 if "1024" in engine or "xl" in engine.lower() else 512
+            width = 1024 if "1024" in engine or "xl" in engine.lower() else 512
             
             # Отправляем запрос
             response = requests.post(
@@ -112,6 +121,10 @@ def generate_stability_image(prompt: str) -> BytesIO | None:
             
             logger.info(f"Получен ответ от Stability AI. Статус: {response.status_code}")
             
+            if response.status_code == 401:
+                logger.error("Недействительный API ключ Stability AI или недостаточно кредитов")
+                return None
+                
             if not response.ok:
                 logger.error(f"Ошибка Stability API для движка {engine}: {response.status_code} - {response.text}")
                 continue  # Пробуем следующий движок
@@ -234,11 +247,19 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("Генерация...")
 
     logger.info(f"Начинаем генерацию изображения с моделью {model}")
+    
+    # Сначала пробуем выбранную модель
     image = (
         generate_stability_image(translated_prompt)
         if model == "stability"
         else generate_hf_image(translated_prompt)
     )
+    
+    # Если Stability API не работает, попробуем Hugging Face
+    if not image and model == "stability" and CONFIG["HF_TOKEN"]:
+        logger.info("Stability API недоступен, пробуем Hugging Face как запасной вариант")
+        await update.message.reply_text("Stability AI временно недоступен, использую Hugging Face...")
+        image = generate_hf_image(translated_prompt)
 
     if not image:
         logger.error(f"Генерация изображения не удалась для промпта: '{prompt}'")
