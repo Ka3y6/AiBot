@@ -212,10 +212,7 @@ def main():
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        close_loop=False,
-        read_timeout=60,
-        write_timeout=60,
-        connect_timeout=60
+        close_loop=False
     )
 
 if __name__ == "__main__":
